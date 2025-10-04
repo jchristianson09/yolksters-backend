@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const stripe = require('stripe')('sk_test_51SEO2n2dUBS3c4mIWkM7LLc9JCJfCXzdzq6Pw6TnX8fgNaak2Y3y2YVWb9IyeeEO4NXKxYITvkiRDJFwvirQc2c100Mg7kPRk5');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
