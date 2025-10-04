@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const stripe = require('stripe')('sk_test_51SEO2n2dUBS3c4mIWkM7LLc9JCJfCXzdzq6Pw6TnX8fgNaak2Y3y2YVWb9IyeeEO4NXKxYITvkiRDJFwvirQc2c100Mg7kPRk5');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,7 +14,8 @@ app.get('/', (req, res) => {
     status: 'ok', 
     message: 'Yolksters API - Crack open clean recipes!',
     endpoints: {
-      '/api/recipe': 'POST - Fetch and parse a recipe URL'
+      '/api/recipe': 'POST - Fetch and parse a recipe URL',
+      '/api/create-checkout': 'POST - Create Stripe checkout session'
     }
   });
 });
@@ -72,8 +74,46 @@ app.post('/api/recipe', async (req, res) => {
     console.error('Error fetching recipe:', error);
     res.status(500).json({
       error: 'Server error',
-      message: 'An error occurred while fetching the recipe. Please try again.',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: 'An error occurred while fetching the recipe. Please try again.'
+    });
+  }
+});
+
+// Stripe checkout endpoint
+app.post('/api/create-checkout', async (req, res) => {
+  try {
+    const { priceId } = req.body;
+    
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'Yolksters Pro',
+              description: 'Unlimited recipes, save favorites, shopping lists, and more!',
+            },
+            unit_amount: 499, // $4.99 in cents
+            recurring: {
+              interval: 'month',
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: 'https://yolksters.com?success=true',
+      cancel_url: 'https://yolksters.com?canceled=true',
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error('Error creating checkout session:', error);
+    res.status(500).json({
+      error: 'Failed to create checkout session',
+      message: error.message
     });
   }
 });
@@ -162,7 +202,7 @@ function extractInstructions(recipeInstructions) {
 }
 
 app.listen(PORT, () => {
-  console.log(`🥚 Yolksters API running on http://localhost:${PORT}`);
+  console.log(`Yolksters API running on http://localhost:${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
