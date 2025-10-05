@@ -3,6 +3,7 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
+const { parseIngredient } = require('./utils/ingredientParser'); // NEW LINE ADDED
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -84,7 +85,11 @@ app.get('/', (req, res) => {
       '/api/recipe': 'POST',
       '/api/create-checkout': 'POST',
       '/api/webhook': 'POST',
-      '/api/user-status': 'GET'
+      '/api/user-status': 'GET',
+      '/api/shopping-list/add-ingredients': 'POST',
+      '/api/shopping-list/grouped': 'GET',
+      '/api/shopping-list/bulk-check': 'POST',
+      '/api/shopping-list/delete-checked': 'DELETE'
     }
   });
 });
@@ -199,6 +204,254 @@ app.get('/api/user-status', async (req, res) => {
     res.json({ status: 'free' });
   }
 });
+
+// ==================== NEW SHOPPING LIST ROUTES ====================
+
+// Parse and add ingredients to shopping list with smart combining
+app.post('/api/shopping-list/add-ingredients', async (req, res) => {
+  try {
+    const { ingredients } = req.body;
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader) {
+      return res.status(401).json({ error: 'No authorization header' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    // Get existing shopping list items
+    const { data: existingItems, error: fetchError } = await supabase
+      .from('shopping_list_items')
+      .select('*')
+      .eq('user_id', user.id);
+    
+    if (fetchError) {
+      return res.status(500).json({ error: fetchError.message });
+    }
+    
+    // Parse all existing items
+    const parsedExisting = existingItems.map(item => ({
+      ...item,
+      parsed: parseIngredient(item.item)
+    }));
+    
+    // Parse new ingredients
+    const newIngredients = ingredients.map(ing => parseIngredient(ing));
+    
+    // Combine logic: match by name and unit
+    const itemsToInsert = [];
+    const itemsToUpdate = [];
+    
+    for (const newIng of newIngredients) {
+      // Try to find matching existing item
+      const match = parsedExisting.find(existing => 
+        existing.parsed.name.toLowerCase() === newIng.name.toLowerCase() &&
+        existing.parsed.unit === newIng.unit
+      );
+      
+      if (match && newIng.quantity && match.parsed.quantity) {
+        // Combine quantities
+        const combinedQty = match.parsed.quantity + newIng.quantity;
+        const combinedText = `${combinedQty} ${newIng.unit || ''} ${newIng.name}`.trim();
+        
+        itemsToUpdate.push({
+          id: match.id,
+          item: combinedText,
+          quantity: combinedQty,
+          unit: newIng.unit,
+          name: newIng.name,
+          category: newIng.category
+        });
+      } else {
+        // Add as new item
+        itemsToInsert.push({
+          user_id: user.id,
+          item: newIng.original,
+          quantity: newIng.quantity,
+          unit: newIng.unit,
+          name: newIng.name,
+          category: newIng.category,
+          checked: false
+        });
+      }
+    }
+    
+    // Update combined items
+    for (const item of itemsToUpdate) {
+      const { error: updateError } = await supabase
+        .from('shopping_list_items')
+        .update({
+          item: item.item,
+          quantity: item.quantity,
+          unit: item.unit,
+          name: item.name,
+          category: item.category
+        })
+        .eq('id', item.id);
+      
+      if (updateError) {
+        console.error('Update error:', updateError);
+      }
+    }
+    
+    // Insert new items
+    if (itemsToInsert.length > 0) {
+      const { error: insertError } = await supabase
+        .from('shopping_list_items')
+        .insert(itemsToInsert);
+      
+      if (insertError) {
+        return res.status(500).json({ error: insertError.message });
+      }
+    }
+    
+    // Return updated list
+    const { data: updatedList, error: finalError } = await supabase
+      .from('shopping_list_items')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('category', { ascending: true })
+      .order('name', { ascending: true });
+    
+    if (finalError) {
+      return res.status(500).json({ error: finalError.message });
+    }
+    
+    res.json({ items: updatedList });
+    
+  } catch (error) {
+    console.error('Add ingredients error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get shopping list grouped by category
+app.get('/api/shopping-list/grouped', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader) {
+      return res.status(401).json({ error: 'No authorization header' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    const { data: items, error } = await supabase
+      .from('shopping_list_items')
+      .select('*')
+      .eq('user_id', user.id);
+    
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    
+    // Group by category
+    const grouped = items.reduce((acc, item) => {
+      const category = item.category || 'Other';
+      if (!acc[category]) {
+        acc[category] = [];
+      }
+      acc[category].push(item);
+      return acc;
+    }, {});
+    
+    // Sort categories by predefined order
+    const categoryOrder = ['Produce', 'Meat & Seafood', 'Dairy', 'Bakery', 'Pantry', 'Frozen', 'Beverages', 'Other'];
+    const sortedGrouped = {};
+    
+    categoryOrder.forEach(cat => {
+      if (grouped[cat]) {
+        sortedGrouped[cat] = grouped[cat].sort((a, b) => a.name.localeCompare(b.name));
+      }
+    });
+    
+    res.json({ grouped: sortedGrouped });
+    
+  } catch (error) {
+    console.error('Get grouped list error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Bulk check/uncheck items
+app.post('/api/shopping-list/bulk-check', async (req, res) => {
+  try {
+    const { checked } = req.body; // true or false
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader) {
+      return res.status(401).json({ error: 'No authorization header' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    const { error } = await supabase
+      .from('shopping_list_items')
+      .update({ checked })
+      .eq('user_id', user.id);
+    
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('Bulk check error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete all checked items
+app.delete('/api/shopping-list/delete-checked', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader) {
+      return res.status(401).json({ error: 'No authorization header' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    const { error } = await supabase
+      .from('shopping_list_items')
+      .delete()
+      .eq('user_id', user.id)
+      .eq('checked', true);
+    
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('Delete checked error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== END NEW ROUTES ====================
 
 function extractRecipeFromHTML(html) {
   const jsonLdMatches = html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>(.*?)<\/script>/gis);
