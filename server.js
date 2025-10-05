@@ -2,9 +2,16 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
 app.use(cors());
 app.use(express.json());
@@ -15,11 +22,14 @@ app.get('/', (req, res) => {
     message: 'Yolksters API - Crack open clean recipes!',
     endpoints: {
       '/api/recipe': 'POST - Fetch and parse a recipe URL',
-      '/api/create-checkout': 'POST - Create Stripe checkout session'
+      '/api/create-checkout': 'POST - Create Stripe checkout session',
+      '/api/webhook': 'POST - Stripe webhook handler',
+      '/api/user-status': 'GET - Get user subscription status'
     }
   });
 });
 
+// Recipe endpoint (unchanged)
 app.post('/api/recipe', async (req, res) => {
   try {
     const { url } = req.body;
@@ -61,7 +71,7 @@ app.post('/api/recipe', async (req, res) => {
     if (!recipeData) {
       return res.status(404).json({
         error: 'Recipe not found',
-        message: 'Could not find recipe data on this page. The site may not use standard recipe markup.'
+        message: 'Could not find recipe data on this page.'
       });
     }
 
@@ -74,18 +84,50 @@ app.post('/api/recipe', async (req, res) => {
     console.error('Error fetching recipe:', error);
     res.status(500).json({
       error: 'Server error',
-      message: 'An error occurred while fetching the recipe. Please try again.'
+      message: 'An error occurred while fetching the recipe.'
     });
   }
 });
 
-// Stripe checkout endpoint
+// Create Stripe checkout session
 app.post('/api/create-checkout', async (req, res) => {
   try {
-    const { priceId } = req.body;
+    const { userId, email } = req.body;
     
-    // Create Stripe checkout session
+    if (!userId || !email) {
+      return res.status(400).json({ 
+        error: 'User ID and email required' 
+      });
+    }
+
+    // Create or get Stripe customer
+    let customer;
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('stripe_customer_id')
+      .eq('id', userId)
+      .single();
+
+    if (existingUser?.stripe_customer_id) {
+      customer = await stripe.customers.retrieve(existingUser.stripe_customer_id);
+    } else {
+      customer = await stripe.customers.create({
+        email: email,
+        metadata: { supabase_user_id: userId }
+      });
+      
+      // Store customer ID
+      await supabase
+        .from('users')
+        .upsert({ 
+          id: userId,
+          email: email,
+          stripe_customer_id: customer.id 
+        });
+    }
+
     const session = await stripe.checkout.sessions.create({
+      customer: customer.id,
       payment_method_types: ['card'],
       line_items: [
         {
@@ -95,7 +137,7 @@ app.post('/api/create-checkout', async (req, res) => {
               name: 'Yolksters Pro',
               description: 'Unlimited recipes, save favorites, shopping lists, and more!',
             },
-            unit_amount: 499, // $4.99 in cents
+            unit_amount: 499,
             recurring: {
               interval: 'month',
             },
@@ -106,6 +148,9 @@ app.post('/api/create-checkout', async (req, res) => {
       mode: 'subscription',
       success_url: 'https://yolksters.com?success=true',
       cancel_url: 'https://yolksters.com?canceled=true',
+      metadata: {
+        supabase_user_id: userId
+      }
     });
 
     res.json({ url: session.url });
@@ -118,6 +163,93 @@ app.post('/api/create-checkout', async (req, res) => {
   }
 });
 
+// Stripe webhook handler
+app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.metadata.supabase_user_id;
+    const subscriptionId = session.subscription;
+
+    // Update user to Pro
+    await supabase
+      .from('users')
+      .update({ 
+        subscription_status: 'pro',
+        subscription_id: subscriptionId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    console.log(`User ${userId} upgraded to Pro`);
+  }
+
+  if (event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object;
+    const customerId = subscription.customer;
+
+    // Find user by customer ID and downgrade
+    const { data: user } = await supabase
+      .from('users')
+      .select('id')
+      .eq('stripe_customer_id', customerId)
+      .single();
+
+    if (user) {
+      await supabase
+        .from('users')
+        .update({ 
+          subscription_status: 'free',
+          subscription_id: null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', user.id);
+
+      console.log(`User ${user.id} downgraded to Free`);
+    }
+  }
+
+  res.json({received: true});
+});
+
+// Get user subscription status
+app.get('/api/user-status', async (req, res) => {
+  try {
+    const userId = req.headers['x-user-id'];
+    
+    if (!userId) {
+      return res.json({ status: 'free' });
+    }
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('subscription_status')
+      .eq('id', userId)
+      .single();
+
+    res.json({ 
+      status: user?.subscription_status || 'free' 
+    });
+  } catch (error) {
+    res.json({ status: 'free' });
+  }
+});
+
+// Helper functions (unchanged)
 function extractRecipeFromHTML(html) {
   const jsonLdMatches = html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>(.*?)<\/script>/gis);
   
@@ -203,7 +335,6 @@ function extractInstructions(recipeInstructions) {
 
 app.listen(PORT, () => {
   console.log(`Yolksters API running on http://localhost:${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 module.exports = app;
