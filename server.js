@@ -450,7 +450,47 @@ app.delete('/api/shopping-list/delete-checked', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
+// Add manual item to shopping list
+app.post('/api/shopping-list/add-manual', async (req, res) => {
+  try {
+    const { item } = req.body;
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader) {
+      return res.status(401).json({ error: 'No authorization header' });
+    }
+    
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    if (!item) {
+      return res.status(400).json({ error: 'Item text required' });
+    }
+    
+    const { data, error } = await supabase
+      .from('shopping_list_items')
+      .insert({
+        user_id: user.id,
+        item: item,
+        category: 'Other',
+        name: item,
+        checked: false
+      })
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.json({ success: true, item: data });
+  } catch (error) {
+    console.error('Error adding manual item:', error);
+    res.status(500).json({ error: 'Failed to add item' });
+  }
+});
 // ==================== END NEW ROUTES ====================
 
 function extractRecipeFromHTML(html) {
